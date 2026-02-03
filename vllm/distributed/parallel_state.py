@@ -322,22 +322,34 @@ class GroupCoordinator:
         self_cpu_group = None
 
         from vllm.config import get_current_vllm_config
+        from vllm.distributed.utils import (
+            _generate_deterministic_port,
+            stateless_init_torch_distributed_process_group_retry,
+        )
 
         config = get_current_vllm_config()
 
         for ranks in group_ranks:
-            if config.parallel_config.enable_stateless_pg and len(ranks) > 1:
+            if (
+                config.parallel_config.enable_stateless_pg
+                and len(ranks) > 1
+                and self.rank in ranks
+            ):
                 self.stateless_backend = torch_distributed_backend
-                from vllm.distributed.utils import (
-                    create_stateless_process_group,
-                )
-
                 ip = config.parallel_config.data_parallel_master_ip
-                device_group = create_stateless_process_group(
-                    ranks=ranks,
-                    rank=self.rank,
-                    backend=torch_distributed_backend,
+                port = _generate_deterministic_port(ranks, host=ip)
+                device_group = stateless_init_torch_distributed_process_group_retry(
                     host=ip,
+                    port=port,
+                    rank=ranks.index(self.rank),
+                    world_size=len(ranks),
+                    backend=self.stateless_backend,
+                )
+                logger.info(
+                    "Successfully initialized pg for ranks %s, in %s:%s",
+                    ranks,
+                    ip,
+                    port,
                 )
             else:
                 device_group = torch.distributed.new_group(
