@@ -37,7 +37,7 @@ class BaseSentinel:
         vllm_config: VllmConfig,
         upstream_cmd_addr: str | None,
         downstream_cmd_addr: str | None,
-        sentinel_identity: bytes | None,
+        dealer_socket_identity: bytes | None,
         sentinel_tag: str | None,
     ):
         self.sentinel_dead = False
@@ -47,13 +47,13 @@ class BaseSentinel:
         self.vllm_config = vllm_config
         self.ft_config = vllm_config.fault_tolerance_config
         if upstream_cmd_addr is not None:
-            assert sentinel_identity is not None
+            assert dealer_socket_identity is not None
             self.upstream_cmd_socket = make_zmq_socket(
                 self.ctx,
                 upstream_cmd_addr,
                 zmq.DEALER,
                 bind=False,
-                identity=sentinel_identity,
+                identity=dealer_socket_identity,
             )
         if downstream_cmd_addr is not None:
             self.downstream_cmd_socket = make_zmq_socket(
@@ -192,9 +192,7 @@ class BaseSentinel:
         """
         raise NotImplementedError
 
-    def _send_execution_result(
-        self, success: bool, method_uuid: str, reason: str | None
-    ):
+    def _send_execution_result(self, ft_result: FaultToleranceRequest):
         """
         Send the result of executing a command back to the upstream.
         """

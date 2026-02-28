@@ -19,9 +19,7 @@ from typing import Any, TypeVar, cast
 import msgspec
 import zmq
 
-
 from vllm.config import (
-    FaultToleranceConfig,
     ParallelConfig,
     VllmConfig,
     set_current_vllm_config,
@@ -70,6 +68,7 @@ from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
     EngineZmqAddresses,
     get_device_indices,
+    serialize_method_call,
 )
 from vllm.v1.executor import Executor
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -111,38 +110,35 @@ class EngineCoreSentinel(BaseSentinel):
         worker_cmd_addr: str,
         engine_fault_socket_addr: str,
         dealer_socket_identity: bytes,
-        tp_size: int,
-        pp_size: int,
-        dp_size: int,
-        fault_tolerance_config: FaultToleranceConfig,
+        vllm_config: VllmConfig,
         engine_core: "EngineCoreProc",
     ):
         self.engine_index = engine_index
         super().__init__(
+            vllm_config=vllm_config,
             upstream_cmd_addr=client_cmd_addr,
             downstream_cmd_addr=worker_cmd_addr,
-            sentinel_identity=sentinel_identity,
+            dealer_socket_identity=dealer_socket_identity,
             sentinel_tag=f"DP_{engine_index}",
-            vllm_config=vllm_config,
         )
 
         self.fault_signal_q = fault_signal_q
         self.cmd_q = cmd_q
         self.busy_loop_active = busy_loop_active
         self.engine_input_q = engine_input_q
-        self.tp_size = tp_size
-        self.pp_size = pp_size
-        self.dp_size = dp_size
+        parallel_config = vllm_config.parallel_config
+        self.tp_size = parallel_config.tensor_parallel_size
+        self.pp_size = parallel_config.pipeline_parallel_size
+        self.dp_size = parallel_config.data_parallel_size
         self.engine_core = engine_core
         self.dealer_socket_identity = dealer_socket_identity
-
         # Client <-> EngineCoreSentinel sockets
         self.engine_fault_socket = make_zmq_socket(
             self.ctx,
             engine_fault_socket_addr,
             zmq.DEALER,
             bind=False,
-            identity=sentinel_identity,
+            identity=dealer_socket_identity,
         )
 
         self.poller = zmq.Poller()
@@ -1210,10 +1206,7 @@ class EngineCoreProc(EngineCore):
                     client_cmd_addr=addresses.engine_core_sentinel_cmd_addr,
                     worker_cmd_addr=worker_cmd_addr,
                     dealer_socket_identity=engine_core_sentinel_ids[self.engine_index],
-                    tp_size=vllm_config.parallel_config.tensor_parallel_size,
-                    pp_size=vllm_config.parallel_config.pipeline_parallel_size,
-                    dp_size=vllm_config.parallel_config.data_parallel_size,
-                    fault_tolerance_config=vllm_config.fault_tolerance_config,
+                    vllm_config=vllm_config,
                     engine_core=self,
                 )
                 vllm_config.fault_tolerance_config.worker_cmd_addr = worker_cmd_addr

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import json
 import multiprocessing
 import os
 import uuid
@@ -10,7 +11,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from multiprocessing import Process, connection
 from multiprocessing.process import BaseProcess
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import patch
 
 import msgspec
@@ -1278,3 +1279,41 @@ def generate_identity_group(peer1, peer2, use, n):
         identity_str = f"{peer1}_{peer2}_{use}_{identity_uuid}".encode()
         identities.append(identity_str)
     return identities
+
+
+def broadcast_instruction(
+    cmd_socket,
+    target_identities: set[bytes] | list[bytes],
+    method_name: str,
+    method_uuid: str | None = None,
+    **kwargs,
+) -> str:
+    """
+    Broadcast an instruction message to multiple remote endpoints.
+    It serializes the specified method_name along with its parameters and
+    dispatches it to all target identities via the provided ZeroMQ socket.
+    """
+    if method_uuid is None:
+        method_uuid = str(uuid.uuid4())
+
+    for identity in target_identities:
+        serialized_instruction = serialize_method_call(
+            method_name, method_uuid, **kwargs
+        )
+        cmd_socket.send_multipart(
+            [identity, b"", serialized_instruction.encode("utf-8")]
+        )
+
+    return method_uuid
+
+
+def serialize_method_call(
+    method: str, method_uuid: str | None = None, **params: Any
+) -> str:
+    """
+    Serialize a method invocation into a JSON string.
+    """
+    if method_uuid is None:
+        method_uuid = str(uuid.uuid4())
+    payload = {"method": method, "method_uuid": method_uuid, **params}
+    return json.dumps(payload)

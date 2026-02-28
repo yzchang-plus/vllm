@@ -122,13 +122,14 @@ class WorkerSentinel(BaseSentinel):
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         self.tp_rank = get_tp_group().rank_in_group
         self.pp_rank = get_pp_group().rank_in_group
+        self.vllm_config = vllm_config
         identity = f"PP{self.pp_rank}_TP{self.tp_rank}"
         super().__init__(
+            vllm_config=vllm_config,
             upstream_cmd_addr=vllm_config.fault_tolerance_config.worker_cmd_addr,
             downstream_cmd_addr=None,
-            sentinel_identity=identity.encode(),
+            dealer_socket_identity=identity.encode(),
             sentinel_tag=f"{self.dp_rank}_{identity}",
-            vllm_config=vllm_config,
         )
         self.init_distributed_env_callback = init_distributed_env_callback
         self.clear_input_batch_callback = clear_input_batch_callback

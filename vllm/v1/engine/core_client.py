@@ -55,8 +55,8 @@ from vllm.v1.engine.exceptions import EngineDeadError, FaultInfo
 from vllm.v1.engine.utils import (
     CoreEngineActorManager,
     CoreEngineProcManager,
-    generate_identity_group,
     broadcast_instruction,
+    generate_identity_group,
     launch_core_engines,
     serialize_method_call,
 )
@@ -404,11 +404,11 @@ class ClientSentinel(BaseSentinel):
         host = vllm_config.parallel_config.data_parallel_master_ip
 
         super().__init__(
+            vllm_config=vllm_config,
             upstream_cmd_addr=None,
             downstream_cmd_addr=engine_core_sentinel_cmd_addr,
-            sentinel_identity=None,
+            dealer_socket_identity=None,
             sentinel_tag=None,
-            vllm_config=vllm_config,
         )
 
         self.fault_tolerance_req_socket = make_zmq_socket(
@@ -483,6 +483,21 @@ class ClientSentinel(BaseSentinel):
             daemon=True,
             name="ClientSentinelFtRequestsLoopThread",
         ).start()
+
+    async def _dispatcher(self):
+        while True:
+            # each elements in the queue contains:
+            # (instruction, timeout, kwargs, future)
+            instruction, timeout, kwargs, fut = await self._task_queue.get()
+            try:
+                kwargs["timeout"] = timeout
+                cmd_str = serialize_method_call(instruction, None, **kwargs)
+                success, _, _ = self._execute_cmd(cmd_str)
+                if fut:
+                    fut.set_result(success)
+            except Exception as e:
+                if fut:
+                    fut.set_exception(e)
 
     def _process_ft_requests_loop(self) -> None:
         """
@@ -564,7 +579,6 @@ class ClientSentinel(BaseSentinel):
                     self.engine_status_dict[i] = {"status": EngineStatusType.PAUSED}
         return success
 
-
     def _pub_engine_status(self):
         engine_status = self.engine_status_dict.to_dict()
         topic = self.ft_config.fault_state_pub_topic.encode()
@@ -578,7 +592,7 @@ class ClientSentinel(BaseSentinel):
 
         target_engines = {
             identity
-            for identity, index in self.engine_identity_to_index.items()
+            for index, identity in self.engine_core_sentinel_identities.items()
             if index not in exclude_dp_ranks
         }
         new_stateless_dp_group_port = get_open_port()
@@ -600,7 +614,8 @@ class ClientSentinel(BaseSentinel):
                 exclude_dp_ranks,
             )
             dead_engine_identities = [
-                self.engine_registry[dead_engine] for dead_engine in exclude_dp_ranks
+                self.engine_core_sentinel_identities[dead_engine]
+                for dead_engine in exclude_dp_ranks
             ]
             temp_kwargs = {"exclude_dp_ranks": exclude_dp_ranks}
 
@@ -613,7 +628,7 @@ class ClientSentinel(BaseSentinel):
             )
             for engine_index in exclude_dp_ranks:
                 self.engine_status_dict.pop(engine_index)
-                self.engine_registry.pop(engine_index)
+                self.engine_core_sentinel_identities.pop(engine_index)
                 key_to_del = [
                     identity
                     for identity, engine_id in self.engine_identity_to_index.items()
@@ -630,11 +645,13 @@ class ClientSentinel(BaseSentinel):
                     engine_status
                 )
 
-                engine_identity = self.engine_registry[old_engine_index_int]
+                engine_identity = self.engine_core_sentinel_identities[
+                    old_engine_index_int
+                ]
 
-                self.engine_registry[original_to_new[old_engine_index]] = (
-                    engine_identity
-                )
+                self.engine_core_sentinel_identities[
+                    original_to_new[old_engine_index]
+                ] = engine_identity
 
                 for identity, engine_index in self.engine_identity_to_index.items():
                     if engine_index == old_engine_index_int:
@@ -652,7 +669,6 @@ class ClientSentinel(BaseSentinel):
         await self._task_queue.put((instruction, timeout, kwargs, fut))
         success = await fut
         return success
-
 
     def _alert_and_pause(self):
         """Receive fault info from engine and pause engines if first fault."""
@@ -685,20 +701,6 @@ class ClientSentinel(BaseSentinel):
                     # the queue.
                     time.sleep(0.1)
 
-            fault_info = FaultInfo.from_json(message)
-            if fault_info.engine_identity not in self.engine_registry.values():
-                return
-            self.engine_exception_q.put_nowait(fault_info)
-            engine_status = "Dead" if "dead" in fault_info.type else "Unhealthy"
-            for engine_index, identity in self.engine_registry.items():
-                if fault_info.engine_identity == identity:
-                    self.engine_status_dict[engine_index] = engine_status
-            self.has_faulted = True
-            self.engine_status_dict[int(fault_info.engine_id)] = engine_status
-            self.fault_pub_socket.send_string(
-                f"vllm_fault|{json.dumps(self.engine_status_dict.to_dict())}"
-            )
-            self.is_faulted.set()
         except zmq.ZMQError:
             # Socket was closed during polling, exit loop.
             self.logger("Fault receiver socket closed, stopping thread.", level="info")
@@ -1023,7 +1025,9 @@ class MPClient(EngineCoreClient):
             # underlying data.
             self.pending_messages = deque[tuple[zmq.MessageTracker, Any]]()
 
-            self.engine_registry = addresses.engine_core_sentinel_identities
+            self.engine_core_sentinel_identities = (
+                addresses.engine_core_sentinel_identities
+            )
             # Start monitoring engine core processes for unexpected failures
             self.start_engine_core_monitor()
 
@@ -1033,13 +1037,14 @@ class MPClient(EngineCoreClient):
                     "engine_fault_socket_addr should not be None at "
                     "fault tolerance scenario"
                 )
-                assert addresses.client_cmd_addr is not None, (
-                    "client_cmd_addr should not be None at fault tolerance scenario"
+                assert addresses.client_sentinel_request_addr is not None, (
+                    "client_sentinel_request_addr should not be None at "
+                    "fault tolerance scenario"
                 )
 
-                assert self.engine_registry is not None
-                assert addresses.fault_pub_socket_addr is not None, (
-                    "addresses.fault_pub_socket_addr should not be None at"
+                assert self.engine_core_sentinel_identities is not None
+                assert addresses.fault_state_pub_socket_addr is not None, (
+                    "addresses.fault_state_pub_socket_addr should not be None at"
                     "fault tolerance scenario"
                 )
                 self.engine_status_dict: ThreadSafeDict[int, str] = ThreadSafeDict()
@@ -1049,16 +1054,6 @@ class MPClient(EngineCoreClient):
                     engine_identity: engine_index
                     for engine_index, engine_identity in enumerate(self.core_engines)
                 }
-                self.client_sentinel = ClientSentinel(
-                    fault_receiver_addr=addresses.engine_fault_socket_addr,
-                    cmd_addr=addresses.client_cmd_addr,
-                    engine_registry=self.engine_registry,
-                    engine_exception_q=self.engine_exception_q,
-                    fault_pub_addr=addresses.fault_pub_socket_addr,
-                    engine_status_dict=self.engine_status_dict,
-                    fault_tolerance_config=vllm_config.fault_tolerance_config,
-                )
-                self.resources.client_sentinel = self.client_sentinel
             success = True
         finally:
             if not success:
@@ -1096,15 +1091,14 @@ class MPClient(EngineCoreClient):
             return
         self_ref = weakref.ref(self)
 
-
-        def shutdown_callback(engine_rank, died_proc, engine_registry):
+        def shutdown_callback(engine_rank, died_proc, engine_core_sentinel_identities):
             """
             Callback to shutdown the client.
             """
             _self = self_ref()
             if not _self:
                 return True
-            target_desc = getattr(target, "name", target)
+            target_desc = getattr(died_proc, "name", died_proc)
             logger.error(
                 "Engine core %s died unexpectedly, shutting down client.",
                 target_desc,
@@ -1126,7 +1120,7 @@ class MPClient(EngineCoreClient):
 
         Thread(
             target=engine_manager.monitor_engine_liveness,
-            args=(engine_down_callback, self.engine_registry),
+            args=(engine_down_callback, self.engine_core_sentinel_identities),
             daemon=True,
             name="ClientEngineMonitor",
         ).start()
@@ -1200,7 +1194,6 @@ class MPClient(EngineCoreClient):
 
     async def fault_reporter(self):
         return self.engine_status_dict.to_dict()
-
 
 
 def _process_utility_output(
